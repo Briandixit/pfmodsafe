@@ -77,7 +77,7 @@ app.disable("x-powered-by");
 app.use((req, res, next) => {
   req.id = req.get("x-request-id") || crypto.randomUUID();
   res.setHeader("X-Request-Id", req.id);
-  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()");
+  res.setHeader("Permissions-Policy", 'camera=(), microphone=(), geolocation=(), payment=(self "https://checkout.razorpay.com"), usb=()');
   next();
 });
 app.use(helmet({
@@ -85,14 +85,15 @@ app.use(helmet({
     useDefaults: true,
     directives: {
       defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", "'unsafe-inline'", "https://cdn.jsdelivr.net"],
+      scriptSrc: ["'self'", "'unsafe-inline'", "https://cdn.jsdelivr.net", "https://checkout.razorpay.com"],
       scriptSrcAttr: ["'unsafe-inline'"],
       styleSrc: ["'self'", "'unsafe-inline'"],
-      imgSrc: ["'self'", "data:"],
-      connectSrc: ["'self'"],
+      imgSrc: ["'self'", "data:", "https:"],
+      connectSrc: ["'self'", "https://api.razorpay.com", "https://checkout.razorpay.com"],
+      frameSrc: ["'self'", "https://api.razorpay.com", "https://checkout.razorpay.com"],
       objectSrc: ["'none'"],
       baseUri: ["'self'"],
-      formAction: ["'self'"],
+      formAction: ["'self'", "https://api.razorpay.com", "https://checkout.razorpay.com"],
       frameAncestors: ["'none'"],
       upgradeInsecureRequests: isProduction ? [] : null,
     },
@@ -1191,7 +1192,7 @@ app.get("/payment/config", authenticate, (req, res) => {
   res.json({ keyId: process.env.RAZORPAY_KEY_ID, currency: "INR" });
 });
 
-app.post("/payment/create-order", authenticate, async (req, res) => {
+async function createPaymentOrderHandler(req, res) {
   const planKey = String(req.body.plan || "").trim().toLowerCase();
   const plan = getPaidPlan(planKey);
   if (!plan) return res.status(400).json({ error: "Invalid paid plan." });
@@ -1220,7 +1221,9 @@ app.post("/payment/create-order", authenticate, async (req, res) => {
     });
 
     res.json({
+      key: process.env.RAZORPAY_KEY_ID,
       keyId: process.env.RAZORPAY_KEY_ID,
+      id: order.id,
       orderId: order.id,
       amount: plan.amount,
       currency: "INR",
@@ -1232,9 +1235,9 @@ app.post("/payment/create-order", authenticate, async (req, res) => {
     logger.error(`Razorpay order error: ${err.message}`);
     res.status(err.statusCode || 500).json({ error: err.message || "Could not create payment order." });
   }
-});
+}
 
-app.post("/payment/verify", authenticate, async (req, res) => {
+async function verifyPaymentHandler(req, res) {
   const orderId = String(req.body.razorpay_order_id || "").trim();
   const paymentId = String(req.body.razorpay_payment_id || "").trim();
   const signature = String(req.body.razorpay_signature || "").trim();
@@ -1259,6 +1262,7 @@ app.post("/payment/verify", authenticate, async (req, res) => {
 
     res.json({
       ok: true,
+      success: true,
       plan: payment.plan,
       limit: getLimitForPlan(payment.plan),
     });
@@ -1266,7 +1270,14 @@ app.post("/payment/verify", authenticate, async (req, res) => {
     logger.error(`Razorpay verify error: ${err.message}`);
     res.status(err.statusCode || 500).json({ error: err.message || "Could not verify payment." });
   }
-});
+}
+
+app.post("/payment/create-order", authenticate, createPaymentOrderHandler);
+app.post("/payment/verify", authenticate, verifyPaymentHandler);
+
+// Compatibility for the older pricing page currently cached/deployed on Railway.
+app.post("/create-order", authenticate, createPaymentOrderHandler);
+app.post("/verify-payment", authenticate, verifyPaymentHandler);
 
 app.get("/stats", authenticate, async (req, res) => {
   const stats = await db.getStatsForApiKey(req.user.apiKey) || { total: 0, abuse: 0, spam: 0, safe: 0 };
