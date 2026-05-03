@@ -207,6 +207,11 @@ const MODERATE_RULES_FILE = path.join(__dirname, "Moderationstrict_cuss_words_10
 
 const PLAN_LIMITS = { free: 1000, starter: 15000, growth: 100000, scale: 500000 };
 const RATE_LIMITS_PER_MINUTE = { free: 500, starter: 2000, growth: 10000, scale: 50000 };
+const PAID_PLANS = {
+  starter: { name: "Starter", amount: 29900 },
+  growth: { name: "Growth", amount: 99900 },
+  scale: { name: "Scale", amount: 249900 },
+};
 const MODERATION_MODES = ["moderation", "off"];
 const MAX_TEXT_LENGTH = 5000;
 const MAX_BATCH_SIZE = 100;
@@ -230,6 +235,9 @@ function normalizeMode(mode) {
 }
 function getLimitForPlan(plan) { return PLAN_LIMITS[plan] ?? PLAN_LIMITS.free; }
 function getRateLimitForPlan(plan) { return RATE_LIMITS_PER_MINUTE[plan] ?? RATE_LIMITS_PER_MINUTE.free; }
+function getPaidPlan(plan) {
+  return PAID_PLANS[String(plan || "").trim().toLowerCase()] || null;
+}
 function createApiKey() { return createSecretToken(32, "ms_live_"); }
 function getApiKeyHash(apiKey) { return hashApiKey(apiKey, API_KEY_PEPPER); }
 function isValidUsername(username) { return /^[a-z0-9._-]{3,32}$/.test(username); }
@@ -442,6 +450,54 @@ function resultPayload(result, processedText, extra = {}) {
   };
 }
 
+function requireRazorpayConfig() {
+  const keyId = process.env.RAZORPAY_KEY_ID;
+  const keySecret = process.env.RAZORPAY_KEY_SECRET;
+  if (!keyId || !keySecret) {
+    const err = new Error("Razorpay is not configured. Set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET.");
+    err.statusCode = 500;
+    throw err;
+  }
+  return { keyId, keySecret };
+}
+
+async function createRazorpayOrder({ amount, currency, receipt, notes }) {
+  const { keyId, keySecret } = requireRazorpayConfig();
+  const auth = Buffer.from(`${keyId}:${keySecret}`).toString("base64");
+  const response = await fetchFn("https://api.razorpay.com/v1/orders", {
+    method: "POST",
+    headers: {
+      Authorization: `Basic ${auth}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      amount,
+      currency,
+      receipt,
+      notes,
+    }),
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const message = data?.error?.description || data?.error?.reason || "Could not create Razorpay order";
+    const err = new Error(message);
+    err.statusCode = response.status;
+    throw err;
+  }
+  return data;
+}
+
+function verifyRazorpaySignature(orderId, paymentId, signature) {
+  const { keySecret } = requireRazorpayConfig();
+  const expected = crypto
+    .createHmac("sha256", keySecret)
+    .update(`${orderId}|${paymentId}`)
+    .digest("hex");
+  if (!signature || expected.length !== String(signature).length) return false;
+  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(String(signature)));
+}
+
 function applyAction(text, flaggedWords, action, category) {
   if (action === "block") return { blocked: true };
   if (!text) return { processedText: text, blocked: false };
@@ -623,6 +679,22 @@ const dbReady = (async () => {
     );
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS payments (
+      id TEXT PRIMARY KEY,
+      username TEXT NOT NULL,
+      api_key TEXT NOT NULL,
+      plan TEXT NOT NULL,
+      amount INTEGER NOT NULL,
+      currency TEXT DEFAULT 'INR',
+      razorpay_order_id TEXT UNIQUE NOT NULL,
+      razorpay_payment_id TEXT,
+      status TEXT DEFAULT 'created',
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      paid_at TIMESTAMPTZ
+    );
+  `);
+
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS apikey TEXT`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS apikey_hash TEXT`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS apikey_prefix TEXT`);
@@ -653,6 +725,18 @@ const dbReady = (async () => {
   await pool.query(`ALTER TABLE logs ADD COLUMN IF NOT EXISTS flagged_word TEXT`);
   await pool.query(`ALTER TABLE logs ADD COLUMN IF NOT EXISTS highlighted_text TEXT`);
   await pool.query(`ALTER TABLE logs ADD COLUMN IF NOT EXISTS timestamp TIMESTAMPTZ DEFAULT NOW()`);
+
+  await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS username TEXT`);
+  await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS api_key TEXT`);
+  await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS plan TEXT`);
+  await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS amount INTEGER`);
+  await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'INR'`);
+  await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS razorpay_order_id TEXT`);
+  await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS razorpay_payment_id TEXT`);
+  await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'created'`);
+  await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()`);
+  await pool.query(`ALTER TABLE payments ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ`);
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS payments_razorpay_order_id_idx ON payments(razorpay_order_id)`);
 })();
 
 const db = {
@@ -720,6 +804,11 @@ const db = {
   async updateUserPassword(username, passwordHash) {
     await dbReady;
     await pool.query(`UPDATE users SET password = $1 WHERE username = $2`, [passwordHash, username]);
+  },
+
+  async updateUserPlan(apiKey, plan) {
+    await dbReady;
+    await pool.query(`UPDATE users SET plan = $1 WHERE apikey = $2`, [plan, apiKey]);
   },
 
   async updateCustomWords(apiKey, wordsArray) {
@@ -841,6 +930,40 @@ const db = {
       WHERE id = $2
       `,
       [correctedCategory, id]
+    );
+  },
+
+  async createPaymentAttempt(payment) {
+    await dbReady;
+    await pool.query(
+      `INSERT INTO payments (
+        id, username, api_key, plan, amount, currency, razorpay_order_id, status, created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'created', NOW())`,
+      [
+        payment.id,
+        payment.username,
+        payment.apiKey,
+        payment.plan,
+        payment.amount,
+        payment.currency || "INR",
+        payment.razorpayOrderId,
+      ]
+    );
+  },
+
+  async getPaymentByRazorpayOrderId(orderId) {
+    await dbReady;
+    const res = await pool.query(`SELECT * FROM payments WHERE razorpay_order_id = $1`, [orderId]);
+    return res.rows[0] || null;
+  },
+
+  async markPaymentPaid(orderId, paymentId) {
+    await dbReady;
+    await pool.query(
+      `UPDATE payments
+       SET status = 'paid', razorpay_payment_id = $1, paid_at = NOW()
+       WHERE razorpay_order_id = $2`,
+      [paymentId, orderId]
     );
   },
 
@@ -1059,6 +1182,90 @@ app.get("/usage", authenticate, async (req, res) => {
   const limit = getLimitForPlan(plan);
   const used = await db.getUsage(apiKey);
   res.json({ used, limit, remaining: Math.max(0, limit - used), plan });
+});
+
+app.get("/payment/config", authenticate, (req, res) => {
+  if (!process.env.RAZORPAY_KEY_ID) {
+    return res.status(500).json({ error: "Razorpay public key is not configured." });
+  }
+  res.json({ keyId: process.env.RAZORPAY_KEY_ID, currency: "INR" });
+});
+
+app.post("/payment/create-order", authenticate, async (req, res) => {
+  const planKey = String(req.body.plan || "").trim().toLowerCase();
+  const plan = getPaidPlan(planKey);
+  if (!plan) return res.status(400).json({ error: "Invalid paid plan." });
+
+  try {
+    const paymentId = crypto.randomUUID();
+    const receipt = `mods_${paymentId.replace(/-/g, "").slice(0, 30)}`;
+    const order = await createRazorpayOrder({
+      amount: plan.amount,
+      currency: "INR",
+      receipt,
+      notes: {
+        username: req.user.username,
+        plan: planKey,
+      },
+    });
+
+    await db.createPaymentAttempt({
+      id: paymentId,
+      username: req.user.username,
+      apiKey: req.user.apiKey,
+      plan: planKey,
+      amount: plan.amount,
+      currency: "INR",
+      razorpayOrderId: order.id,
+    });
+
+    res.json({
+      keyId: process.env.RAZORPAY_KEY_ID,
+      orderId: order.id,
+      amount: plan.amount,
+      currency: "INR",
+      plan: planKey,
+      planName: plan.name,
+      username: req.user.username,
+    });
+  } catch (err) {
+    logger.error(`Razorpay order error: ${err.message}`);
+    res.status(err.statusCode || 500).json({ error: err.message || "Could not create payment order." });
+  }
+});
+
+app.post("/payment/verify", authenticate, async (req, res) => {
+  const orderId = String(req.body.razorpay_order_id || "").trim();
+  const paymentId = String(req.body.razorpay_payment_id || "").trim();
+  const signature = String(req.body.razorpay_signature || "").trim();
+  if (!orderId || !paymentId || !signature) {
+    return res.status(400).json({ error: "Missing Razorpay payment details." });
+  }
+
+  try {
+    const payment = await db.getPaymentByRazorpayOrderId(orderId);
+    if (!payment || payment.api_key !== req.user.apiKey) {
+      return res.status(404).json({ error: "Payment order not found." });
+    }
+    if (!getPaidPlan(payment.plan)) {
+      return res.status(400).json({ error: "Payment order has an invalid plan." });
+    }
+    if (!verifyRazorpaySignature(orderId, paymentId, signature)) {
+      return res.status(400).json({ error: "Payment verification failed." });
+    }
+
+    await db.markPaymentPaid(orderId, paymentId);
+    await db.updateUserPlan(req.user.apiKey, payment.plan);
+
+    res.json({
+      ok: true,
+      plan: payment.plan,
+      limit: getLimitForPlan(payment.plan),
+    });
+  } catch (err) {
+    logger.error(`Razorpay verify error: ${err.message}`);
+    res.status(err.statusCode || 500).json({ error: err.message || "Could not verify payment." });
+  }
 });
 
 app.get("/stats", authenticate, async (req, res) => {

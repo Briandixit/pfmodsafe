@@ -150,7 +150,7 @@
         <li>Custom moderation rules</li>
         <li>Email support</li>
       </ul>
-      <a class="btn primary" href="auth.html">Choose Starter</a>
+      <button class="btn primary pay-btn" type="button" data-plan="starter">Choose Starter</button>
       <div class="small">Response within 24h</div>
     </div>
 
@@ -165,7 +165,7 @@
         <li>Team access</li>
         <li>Custom blocked terms</li>
       </ul>
-      <a class="btn ghost" href="auth.html">Choose Growth</a>
+      <button class="btn ghost pay-btn" type="button" data-plan="growth">Choose Growth</button>
       <div class="small">Response within 8h</div>
     </div>
 
@@ -180,10 +180,12 @@
         <li>Priority onboarding</li>
         <li>Production‑ready setup</li>
       </ul>
-      <a class="btn ghost" href="auth.html">Talk to sales</a>
+      <button class="btn ghost pay-btn" type="button" data-plan="scale">Choose Scale</button>
       <div class="small">Same‑day priority</div>
     </div>
   </div>
+
+  <div id="paymentStatus" class="small" style="min-height: 22px; margin-top: 18px; font-weight: 800;"></div>
 
   <div class="section-label">Plan comparison</div>
   <div class="compare">
@@ -209,11 +211,111 @@
   <p style="margin-top: 12px;">© 2026 ModSafe – Indian Language Moderation API</p>
 </footer>
 
+<script src="https://checkout.razorpay.com/v1/checkout.js"></script>
 <script>
-const apiKey = localStorage.getItem("apiKey");
+let apiKey = localStorage.getItem("apiKey");
 const dashBtn = document.getElementById("dashBtn");
 dashBtn.href = apiKey ? "index.html" : "auth.html";
 dashBtn.innerText = apiKey ? "Dashboard" : "Get started";
+
+function setPaymentStatus(message, color = "#64748b") {
+  const status = document.getElementById("paymentStatus");
+  status.textContent = message;
+  status.style.color = color;
+}
+
+async function apiFetch(path, options = {}) {
+  const headers = {
+    "Content-Type": "application/json",
+    ...(apiKey ? { "x-api-key": apiKey } : {}),
+    ...options.headers,
+  };
+  const response = await fetch(path, {
+    ...options,
+    headers,
+    credentials: "include",
+  });
+  let data = {};
+  try { data = await response.json(); } catch { data = {}; }
+  return { response, data };
+}
+
+async function hasActiveLogin() {
+  if (apiKey) return true;
+  const { response, data } = await apiFetch("/me", { method: "GET" });
+  if (!response.ok || data.error) return false;
+  apiKey = data.apiKey || "";
+  localStorage.setItem("apiKey", apiKey);
+  localStorage.setItem("username", data.username || "");
+  localStorage.setItem("plan", data.plan || "free");
+  return true;
+}
+
+function requireLogin(plan) {
+  localStorage.setItem("pendingPlan", plan);
+  window.location.href = "auth.html";
+}
+
+async function startPayment(plan) {
+  if (!(await hasActiveLogin())) {
+    requireLogin(plan);
+    return;
+  }
+  if (!window.Razorpay) {
+    setPaymentStatus("Razorpay checkout did not load. Check your internet connection.", "#dc2626");
+    return;
+  }
+
+  setPaymentStatus("Creating secure payment order...");
+  const { response, data } = await apiFetch("/payment/create-order", {
+    method: "POST",
+    body: JSON.stringify({ plan }),
+  });
+
+  if (!response.ok || data.error) {
+    setPaymentStatus(data.error || "Could not start payment.", "#dc2626");
+    return;
+  }
+
+  const options = {
+    key: data.keyId,
+    amount: data.amount,
+    currency: data.currency,
+    name: "ModSafe",
+    description: `${data.planName} plan`,
+    order_id: data.orderId,
+    prefill: {
+      name: localStorage.getItem("username") || data.username || "",
+    },
+    theme: { color: "#2563eb" },
+    handler: async function (payment) {
+      setPaymentStatus("Verifying payment...");
+      const verify = await apiFetch("/payment/verify", {
+        method: "POST",
+        body: JSON.stringify(payment),
+      });
+      if (!verify.response.ok || verify.data.error) {
+        setPaymentStatus(verify.data.error || "Payment verification failed.", "#dc2626");
+        return;
+      }
+      localStorage.setItem("plan", verify.data.plan);
+      localStorage.removeItem("pendingPlan");
+      setPaymentStatus("Payment successful. Your plan is active.", "#059669");
+      setTimeout(() => { window.location.href = "index.html"; }, 900);
+    },
+    modal: {
+      ondismiss: function () {
+        setPaymentStatus("Payment cancelled.", "#b45309");
+      },
+    },
+  };
+
+  new Razorpay(options).open();
+}
+
+document.querySelectorAll(".pay-btn").forEach((button) => {
+  button.addEventListener("click", () => startPayment(button.dataset.plan));
+});
 </script>
 </body>
 </html>
